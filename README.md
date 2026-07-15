@@ -16,3 +16,27 @@ Dashboard API (cloud-managed REST API -- no SSH/CLI access required).
   and API errors (invalid key, unreachable API)
 
 ## Folder structure
+
+src/
+meraki_client.py      # Core client: API session, org/network/device/SSID listing, CLI
+logs/
+meraki_client.log     # Structured runtime logs
+reports/                  # (reserved for future CSV/JSON export output)
+tests/                    # Unit tests
+.env.example               # Template for MERAKI_API_KEY
+requirements.txt
+
+## Project Status
+
+- **Day 1** — Complete. Project structure, `.env` config, initial README.
+- **Day 2** — Complete. `src/meraki_client.py` built with `list_organizations`, `list_networks`, `list_devices`, `list_ssids`; argparse CLI (`--list-orgs`, `--list-networks`, `--list-devices`, `--list-ssids`); structured logging; graceful error/empty-state handling. Live-tested end-to-end against a personal Meraki organization and two test networks.
+
+## Usage
+
+python src/meraki_client.py --list-orgs
+python src/meraki_client.py --list-networks
+python src/meraki_client.py --list-devices
+python src/meraki_client.py --list-ssids
+
+Requires a `MERAKI_API_KEY` set in a `.env` file (see `.env.example`).
+
