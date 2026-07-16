@@ -37,6 +37,11 @@ python src/meraki_client.py --list-orgs
 python src/meraki_client.py --list-networks
 python src/meraki_client.py --list-devices
 python src/meraki_client.py --list-ssids
+python src/meraki_client.py --export json
+python src/meraki_client.py --export csv
+
+Running with no flags performs the full audit (orgs, networks, devices, SSIDs) and prints results as console tables. Add `--export json` or `--export csv` to also write results to the `reports/` folder — JSON as a single nested file, CSV as one flat file per category (organizations, networks, devices, SSIDs), skipping any category with no data.
 
 Requires a `MERAKI_API_KEY` set in a `.env` file (see `.env.example`).
+
 
