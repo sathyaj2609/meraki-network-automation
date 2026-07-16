@@ -1,27 +1,3 @@
-"""
-meraki_client.py
-
-Core Meraki Dashboard API connection logic.
-
-Responsibilities:
-    - Load MERAKI_API_KEY from the environment (.env) and build a
-      DashboardAPI session.
-    - List the organizations the key has access to, and the networks
-      within a given organization.
-    - Fail loudly (with a single, catchable exception) when the key is
-      missing/invalid or the API can't be reached, so callers (e.g. a
-      future audit/report script that walks org -> network -> device)
-      can decide whether to retry, skip, or abort.
-
-Unlike SSH-based device automation, there's no per-device connection
-here. DashboardAPI() opens one authenticated HTTPS session that every
-call reuses -- listing organizations, networks, and (later) devices are
-all just different endpoints on that same session. Building the client
-is therefore split out (get_dashboard) from using it (list_organizations,
-list_networks), so the session is created once and passed around instead
-of being rebuilt per call.
-"""
-
 import argparse
 import csv
 import json
@@ -30,7 +6,6 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-
 
 import meraki
 from dotenv import load_dotenv
@@ -78,11 +53,6 @@ def get_dashboard() -> meraki.DashboardAPI:
         )
 
     logger.info("Initializing Meraki DashboardAPI session...")
-    # suppress_logging=True: the SDK ships its own logger that (by
-    # default) writes a timestamped log file to the working directory
-    # and echoes every request/response to the console. We disable it
-    # and rely on our own logger below for connection attempts/results,
-    # matching how the rest of this project handles logging.
     dashboard = meraki.DashboardAPI(api_key=api_key, suppress_logging=True)
     logger.info("DashboardAPI session ready.")
     return dashboard
@@ -112,6 +82,8 @@ def list_networks(dashboard: meraki.DashboardAPI, organization_id: str) -> list:
 
     logger.info("Found %d network(s) in organization %s.", len(networks), organization_id)
     return networks
+
+
 def list_devices(dashboard: meraki.DashboardAPI, network_id: str) -> list:
     """Return every device within the given network."""
     logger.info("Fetching devices for network %s...", network_id)
@@ -122,8 +94,10 @@ def list_devices(dashboard: meraki.DashboardAPI, network_id: str) -> list:
     logger.info("Found %d device(s) in network %s.", len(devices), network_id)
     return devices
 
+
 def list_ssids(dashboard: meraki.DashboardAPI, network_id: str) -> list:
     """Return every wireless SSID configured on the given network.
+
     Meraki networks always have a fixed set of SSID slots (commonly 15),
     most of which are disabled by default. We return all of them here;
     callers can filter by "enabled" if they only care about active SSIDs.
@@ -139,6 +113,21 @@ def list_ssids(dashboard: meraki.DashboardAPI, network_id: str) -> list:
         len(ssids), network_id, enabled_count,
     )
     return ssids
+
+
+def _describe_api_error(exc: meraki.APIError) -> str:
+    """Translate a meraki.APIError into a clear, situation-specific message.
+
+    The SDK collapses HTTP errors *and* connection failures (DNS, timeout,
+    no route) into the same APIError after exhausting its retries, so we
+    branch on status to tell the two apart for the log/error message.
+    """
+    if exc.status == 401:
+        return "Meraki API rejected the request: invalid or revoked API key."
+    if exc.status is None:
+        return f"Could not reach the Meraki API (connection issue): {exc.reason}"
+    return f"Meraki API error {exc.status}: {exc.reason} - {exc.message}"
+
 
 def get_reports_dir() -> Path:
     """Return the reports/ directory, creating it if needed."""
@@ -172,8 +161,60 @@ def export_csv(rows: list, fieldnames: list, category: str, timestamp: str) -> P
     logger.info("Exported CSV report to %s", path)
     return path
 
+
+def audit_security(audit_data: dict) -> list:
+    """Scan collected audit data for basic wireless/device security findings.
+
+    This is a lightweight, opinionated check -- not a replacement for a
+    real security audit -- but it demonstrates the kind of pattern-based
+    review a network security engineer would automate: flagging open
+    wireless auth, noting PSK as adequate-but-improvable, and calling out
+    networks with no claimed hardware (worth a manual look).
+
+    Returns a list of dicts: {network, category, severity, finding}.
+    """
+    findings = []
+
+    networks_by_id = {n.get("id"): n.get("name", n.get("id")) for n in audit_data.get("networks", [])}
+
+    for net_id, ssids in audit_data.get("ssids", {}).items():
+        net_name = networks_by_id.get(net_id, net_id)
+        for ssid in ssids:
+            if not ssid.get("enabled"):
+                continue
+            auth_mode = ssid.get("authMode", "-")
+            ssid_name = ssid.get("name", "-")
+            if auth_mode == "open":
+                findings.append({
+                    "network": net_name,
+                    "category": "Wireless Auth",
+                    "severity": "High",
+                    "finding": f"SSID '{ssid_name}' is enabled with open (unencrypted) authentication.",
+                })
+            elif auth_mode == "psk":
+                findings.append({
+                    "network": net_name,
+                    "category": "Wireless Auth",
+                    "severity": "Low",
+                    "finding": f"SSID '{ssid_name}' uses PSK auth; consider WPA3-Enterprise/802.1X for production.",
+                })
+
+    for net_id, devices in audit_data.get("devices", {}).items():
+        net_name = networks_by_id.get(net_id, net_id)
+        if not devices:
+            findings.append({
+                "network": net_name,
+                "category": "Device Inventory",
+                "severity": "Info",
+                "finding": "No devices claimed in this network. Confirm this is intentional (staging/unused).",
+            })
+
+    return findings
+
+
 def parse_args() -> argparse.Namespace:
     """Define and parse command-line flags for this script.
+
     No flags -> run everything (orgs, networks, devices, SSIDs), which
     matches the "just show me what's out there" default a first-time
     user expects. Passing any specific --list-* flag narrows the run to
@@ -198,12 +239,19 @@ def parse_args() -> argparse.Namespace:
         help="List enabled wireless SSIDs in each network.",
     )
     parser.add_argument(
+        "--audit-security", action="store_true",
+        help="Run basic security findings (open auth, PSK-only, unclaimed devices).",
+    )
+    parser.add_argument(
         "--export", choices=["csv", "json"], default=None,
         help="Also write results to reports/ in the given format.",
     )
     args = parser.parse_args()
 
     # If the user didn't pass any specific --list-* flag, run all of them.
+    # --audit-security and --export are opt-in only and never implied by
+    # the "no flags" default, since they're additive analysis/output
+    # steps rather than core listing operations.
     if not any([args.list_orgs, args.list_networks, args.list_devices, args.list_ssids]):
         args.list_orgs = args.list_networks = args.list_devices = args.list_ssids = True
 
@@ -251,8 +299,9 @@ if __name__ == "__main__":
         console.print(org_table)
 
     # Networks, devices, and SSIDs all need the first org's networks, so
-    # fetch them whenever any of those three flags is set.
-    if args.list_networks or args.list_devices or args.list_ssids:
+    # fetch them whenever any of those three flags -- or security audit,
+    # which depends on devices/SSIDs -- is set.
+    if args.list_networks or args.list_devices or args.list_ssids or args.audit_security:
         first_org = organizations[0]
         org_id = first_org.get("id")
         org_name = first_org.get("name", org_id)
@@ -280,6 +329,11 @@ if __name__ == "__main__":
                 )
             console.print(net_table)
 
+        # Security audit needs devices and SSIDs collected for every
+        # network, even if the user didn't pass --list-devices/--list-ssids.
+        need_devices = args.list_devices or args.audit_security
+        need_ssids = args.list_ssids or args.audit_security
+
         for net in networks:
             net_id = net.get("id")
             net_name = net.get("name", net_id)
@@ -287,54 +341,75 @@ if __name__ == "__main__":
             audit_data.setdefault("devices", {})
             audit_data.setdefault("ssids", {})
 
-            if args.list_devices:
+            if need_devices:
                 try:
                     devices = list_devices(dashboard, net_id)
                 except MerakiClientError as exc:
                     logger.error(str(exc))
                 else:
                     audit_data["devices"][net_id] = devices
-                    if not devices:
-                        console.print(f"[dim]No devices found in '{net_name}'.[/dim]")
-                    else:
-                        device_table = Table(title=f"Devices in '{net_name}'")
-                        device_table.add_column("Name", style="cyan")
-                        device_table.add_column("Model", style="magenta")
-                        device_table.add_column("Serial", style="green")
-                        device_table.add_column("Status", style="yellow")
-                        for device in devices:
-                            device_table.add_row(
-                                device.get("name", "-"),
-                                device.get("model", "-"),
-                                device.get("serial", "-"),
-                                device.get("status", "-"),
-                            )
-                        console.print(device_table)
+                    if args.list_devices:
+                        if not devices:
+                            console.print(f"[dim]No devices found in '{net_name}'.[/dim]")
+                        else:
+                            device_table = Table(title=f"Devices in '{net_name}'")
+                            device_table.add_column("Name", style="cyan")
+                            device_table.add_column("Model", style="magenta")
+                            device_table.add_column("Serial", style="green")
+                            device_table.add_column("Status", style="yellow")
+                            for device in devices:
+                                device_table.add_row(
+                                    device.get("name", "-"),
+                                    device.get("model", "-"),
+                                    device.get("serial", "-"),
+                                    device.get("status", "-"),
+                                )
+                            console.print(device_table)
 
-            if args.list_ssids:
+            if need_ssids:
                 try:
                     ssids = list_ssids(dashboard, net_id)
                 except MerakiClientError as exc:
                     logger.error(str(exc))
                 else:
                     audit_data["ssids"][net_id] = ssids
-                    enabled_ssids = [s for s in ssids if s.get("enabled")]
-                    if not enabled_ssids:
-                        console.print(f"[dim]No enabled SSIDs found in '{net_name}'.[/dim]")
-                    else:
-                        ssid_table = Table(title=f"Wireless SSIDs in '{net_name}'")
-                        ssid_table.add_column("Number", style="cyan")
-                        ssid_table.add_column("Name", style="magenta")
-                        ssid_table.add_column("Enabled", style="green")
-                        ssid_table.add_column("Auth Mode", style="yellow")
-                        for ssid in enabled_ssids:
-                            ssid_table.add_row(
-                                str(ssid.get("number", "-")),
-                                ssid.get("name", "-"),
-                                str(ssid.get("enabled", "-")),
-                                ssid.get("authMode", "-"),
-                            )
-                        console.print(ssid_table)
+                    if args.list_ssids:
+                        enabled_ssids = [s for s in ssids if s.get("enabled")]
+                        if not enabled_ssids:
+                            console.print(f"[dim]No enabled SSIDs found in '{net_name}'.[/dim]")
+                        else:
+                            ssid_table = Table(title=f"Wireless SSIDs in '{net_name}'")
+                            ssid_table.add_column("Number", style="cyan")
+                            ssid_table.add_column("Name", style="magenta")
+                            ssid_table.add_column("Enabled", style="green")
+                            ssid_table.add_column("Auth Mode", style="yellow")
+                            for ssid in enabled_ssids:
+                                ssid_table.add_row(
+                                    str(ssid.get("number", "-")),
+                                    ssid.get("name", "-"),
+                                    str(ssid.get("enabled", "-")),
+                                    ssid.get("authMode", "-"),
+                                )
+                            console.print(ssid_table)
+
+    if args.audit_security:
+        findings = audit_security(audit_data)
+        audit_data["security_findings"] = findings
+        if not findings:
+            console.print("[green]No security findings.[/green]")
+        else:
+            finding_table = Table(title="Security Findings")
+            finding_table.add_column("Network", style="cyan")
+            finding_table.add_column("Category", style="magenta")
+            finding_table.add_column("Severity", style="yellow")
+            finding_table.add_column("Finding", style="white")
+            for f in findings:
+                severity_style = {"High": "bold red", "Low": "yellow", "Info": "dim"}.get(f["severity"], "white")
+                finding_table.add_row(
+                    f["network"], f["category"], f"[{severity_style}]{f['severity']}[/{severity_style}]", f["finding"]
+                )
+            console.print(finding_table)
+
     if args.export:
         if args.export == "json":
             export_json(audit_data, timestamp)
@@ -367,5 +442,9 @@ if __name__ == "__main__":
                 ]
                 if ssid_rows:
                     export_csv(ssid_rows, ["network_id", "number", "name", "enabled", "authMode"], "ssids", timestamp)
+            if audit_data.get("security_findings"):
+                export_csv(
+                    audit_data["security_findings"],
+                    ["network", "category", "severity", "finding"], "security_findings", timestamp,
+                )
         console.print(f"[green]Export complete.[/green] See reports/ folder.")
-
