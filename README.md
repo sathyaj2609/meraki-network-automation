@@ -4,6 +4,8 @@ A Python automation suite for auditing and reporting on Cisco Meraki
 organizations, networks, devices, and wireless SSIDs via the Meraki
 Dashboard API (cloud-managed REST API -- no SSH/CLI access required).
 
+Includes 15 unit tests (pytest, fully mocked — no live API calls or credentials required to run the test suite).
+
 ## Features
 
 - List all Meraki organizations accessible to your API key
