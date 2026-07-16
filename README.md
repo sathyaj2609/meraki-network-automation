@@ -14,6 +14,7 @@ Dashboard API (cloud-managed REST API -- no SSH/CLI access required).
 - Structured logging to console and file (`logs/meraki_client.log`)
 - Graceful handling of empty results (e.g. networks with no devices)
   and API errors (invalid key, unreachable API)
+- Basic security audit (`--audit-security`): flags open/PSK wireless auth and networks with no claimed devices
 
 ## Folder structure
 
@@ -39,6 +40,7 @@ python src/meraki_client.py --list-devices
 python src/meraki_client.py --list-ssids
 python src/meraki_client.py --export json
 python src/meraki_client.py --export csv
+python src/meraki_client.py --audit-security
 
 Running with no flags performs the full audit (orgs, networks, devices, SSIDs) and prints results as console tables. Add `--export json` or `--export csv` to also write results to the `reports/` folder — JSON as a single nested file, CSV as one flat file per category (organizations, networks, devices, SSIDs), skipping any category with no data.
 
