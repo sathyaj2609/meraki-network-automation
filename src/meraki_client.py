@@ -23,10 +23,14 @@ of being rebuilt per call.
 """
 
 import argparse
+import csv
+import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
+
 
 import meraki
 from dotenv import load_dotenv
@@ -136,19 +140,37 @@ def list_ssids(dashboard: meraki.DashboardAPI, network_id: str) -> list:
     )
     return ssids
 
+def get_reports_dir() -> Path:
+    """Return the reports/ directory, creating it if needed."""
+    project_root = Path(__file__).resolve().parent.parent
+    reports_dir = project_root / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    return reports_dir
 
-def _describe_api_error(exc: meraki.APIError) -> str:
-    """Translate a meraki.APIError into a clear, situation-specific message.
 
-    The SDK collapses HTTP errors *and* connection failures (DNS, timeout,
-    no route) into the same APIError after exhausting its retries, so we
-    branch on status to tell the two apart for the log/error message.
+def export_json(data: dict, timestamp: str) -> Path:
+    """Write the full nested audit result to a single JSON file."""
+    path = get_reports_dir() / f"meraki_audit_{timestamp}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    logger.info("Exported JSON report to %s", path)
+    return path
+
+
+def export_csv(rows: list, fieldnames: list, category: str, timestamp: str) -> Path:
+    """Write one flat list of dict rows to a CSV file.
+
+    Each category (organizations, networks, devices, ssids) gets its own
+    file since CSV can't represent the nested org -> network -> device
+    relationship the way JSON can.
     """
-    if exc.status == 401:
-        return "Meraki API rejected the request: invalid or revoked API key."
-    if exc.status is None:
-        return f"Could not reach the Meraki API (connection issue): {exc.reason}"
-    return f"Meraki API error {exc.status}: {exc.reason} - {exc.message}"
+    path = get_reports_dir() / f"meraki_{category}_{timestamp}.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Exported CSV report to %s", path)
+    return path
 
 def parse_args() -> argparse.Namespace:
     """Define and parse command-line flags for this script.
@@ -174,6 +196,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--list-ssids", action="store_true",
         help="List enabled wireless SSIDs in each network.",
+    )
+    parser.add_argument(
+        "--export", choices=["csv", "json"], default=None,
+        help="Also write results to reports/ in the given format.",
     )
     args = parser.parse_args()
 
@@ -209,6 +235,9 @@ if __name__ == "__main__":
         logger.error(str(exc))
         sys.exit(1)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    audit_data = {"organizations": organizations}
+
     if not organizations:
         logger.warning("API key is valid, but has no organizations to show.")
         sys.exit(0)
@@ -234,6 +263,8 @@ if __name__ == "__main__":
             logger.error(str(exc))
             sys.exit(1)
 
+        audit_data["networks"] = networks
+
         if args.list_networks:
             net_table = Table(title=f"Networks in '{org_name}'")
             net_table.add_column("Name", style="cyan")
@@ -253,12 +284,16 @@ if __name__ == "__main__":
             net_id = net.get("id")
             net_name = net.get("name", net_id)
 
+            audit_data.setdefault("devices", {})
+            audit_data.setdefault("ssids", {})
+
             if args.list_devices:
                 try:
                     devices = list_devices(dashboard, net_id)
                 except MerakiClientError as exc:
                     logger.error(str(exc))
                 else:
+                    audit_data["devices"][net_id] = devices
                     if not devices:
                         console.print(f"[dim]No devices found in '{net_name}'.[/dim]")
                     else:
@@ -282,6 +317,7 @@ if __name__ == "__main__":
                 except MerakiClientError as exc:
                     logger.error(str(exc))
                 else:
+                    audit_data["ssids"][net_id] = ssids
                     enabled_ssids = [s for s in ssids if s.get("enabled")]
                     if not enabled_ssids:
                         console.print(f"[dim]No enabled SSIDs found in '{net_name}'.[/dim]")
@@ -299,3 +335,37 @@ if __name__ == "__main__":
                                 ssid.get("authMode", "-"),
                             )
                         console.print(ssid_table)
+    if args.export:
+        if args.export == "json":
+            export_json(audit_data, timestamp)
+        elif args.export == "csv":
+            if audit_data.get("organizations"):
+                export_csv(
+                    [{"name": o.get("name"), "id": o.get("id")} for o in audit_data["organizations"]],
+                    ["name", "id"], "organizations", timestamp,
+                )
+            if audit_data.get("networks"):
+                export_csv(
+                    [{"name": n.get("name"), "id": n.get("id"),
+                      "productTypes": ", ".join(n.get("productTypes", [])),
+                      "timeZone": n.get("timeZone")} for n in audit_data["networks"]],
+                    ["name", "id", "productTypes", "timeZone"], "networks", timestamp,
+                )
+            if audit_data.get("devices"):
+                device_rows = [
+                    {"network_id": net_id, "name": d.get("name"), "model": d.get("model"),
+                     "serial": d.get("serial"), "status": d.get("status")}
+                    for net_id, devices in audit_data["devices"].items() for d in devices
+                ]
+                if device_rows:
+                    export_csv(device_rows, ["network_id", "name", "model", "serial", "status"], "devices", timestamp)
+            if audit_data.get("ssids"):
+                ssid_rows = [
+                    {"network_id": net_id, "number": s.get("number"), "name": s.get("name"),
+                     "enabled": s.get("enabled"), "authMode": s.get("authMode")}
+                    for net_id, ssids in audit_data["ssids"].items() for s in ssids
+                ]
+                if ssid_rows:
+                    export_csv(ssid_rows, ["network_id", "number", "name", "enabled", "authMode"], "ssids", timestamp)
+        console.print(f"[green]Export complete.[/green] See reports/ folder.")
+
